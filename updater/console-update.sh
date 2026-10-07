@@ -46,5 +46,7 @@ fi
 
 log "Update to UniFi OS Server ${REQUESTED} requested from the UniFi OS console"
 rm -f "${REQUEST_FILE}" "${REQUEST_FILE}.build"
+# The installer UniFi OS downloaded is not needed (the image is pulled), keep it out of the backup.
+rm -f /uos/data/unifi-core/firmware/fwupdate.bin
 
 FORCE_VERSION="${REQUESTED}" update.sh

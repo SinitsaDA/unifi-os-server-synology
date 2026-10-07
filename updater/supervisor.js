@@ -21,6 +21,7 @@ const URL = process.env.SUPERVISOR_URL || `wss://${CONTAINER}:11084/api/ws/super
 const WEB_PORT = Number(process.env.UOS_WEB_PORT || 11443)
 const REQUEST_FILE = process.env.UPDATE_REQUEST_FILE || '/uos/boot/uos-update.json'
 const DATA_DIR = '/uos/data'
+const FIRMWARE_INFO = `${DATA_DIR}/unifi-core/config/firmware.yaml`
 const RECONNECT_MS = 15000
 
 const log = (...args) => console.log(new Date().toISOString().replace('T', ' ').slice(0, 19), '[supervisor]', ...args)
@@ -102,14 +103,31 @@ const handlers = {
   hasLegacyNet: () => ({ hasLegacyNet: false }),
   legacyNetBackup: () => ({ backupCreated: false, error: NOT_SUPPORTED }),
   exportSupportData: () => ({}),
-  firmwareUpdate: (body) => {
-    const version = String(body && body.version || '').replace(/^v/, '')
-    if (!/^\d+(\.\d+)+$/.test(version)) throw new Error(`Invalid firmware version: ${body && body.version}`)
+  // UniFi OS downloads and checks the installer itself (/data/unifi-core/firmware/fwupdate.bin) and
+  // passes its path; the version is the one it downloaded (latest in unifi-core/config/firmware.yaml).
+  firmwareUpdate: async (body) => {
+    const version = String((body && body.version) || downloadedVersion() || '').replace(/^v/, '')
+    if (!/^\d+(\.\d+)+$/.test(version)) throw new Error(`Unable to determine the firmware version (${JSON.stringify(body)})`)
     const request = { version, requestedAt: new Date().toISOString(), firmware: body }
     fs.writeFileSync(`${REQUEST_FILE}.tmp`, JSON.stringify(request, null, 2))
     fs.renameSync(`${REQUEST_FILE}.tmp`, REQUEST_FILE)
     log(`Update to UniFi OS Server ${version} requested from the console`)
+    // UniFi OS waits for the update progress (/var/run/fwupdate.pid -> /var/run/fwupdate.status.<pid>):
+    // "updating" makes it report "Firmware ready, rebooting to update" until the updater replaces the container.
+    await dockerExec(['sh', '-c', 'echo updating > /var/run/fwupdate.status.1 && echo 1 > /var/run/fwupdate.pid'])
+      .catch(err => log('Unable to report the update progress:', err.message))
     return {}
+  }
+}
+
+function downloadedVersion () {
+  try {
+    const yaml = fs.readFileSync(FIRMWARE_INFO, 'utf8')
+    const latest = yaml.match(/^latest:\n((?:[ \t].*\n?)*)/m)
+    const version = latest && latest[1].match(/^ {2}version: '?v?([\d.]+)'?$/m)
+    return version ? version[1] : null
+  } catch (_) {
+    return null
   }
 }
 
