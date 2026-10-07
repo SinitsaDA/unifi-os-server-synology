@@ -1,0 +1,192 @@
+name: Build image
+
+# Builds ghcr.io/<owner>/unifi-os-server:<version> from the official UniFi OS Server installer:
+# the installer is run on the runner (it installs UniFi OS Server with Podman), the original
+# "uosserver" image is taken from Podman, the entrypoint with the Synology patches is added
+# (image/), the result is started and checked, and only then published.
+
+on:
+  schedule:
+    # New UniFi OS Server releases are picked up within 3 hours.
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "UniFi OS Server version, e.g. 5.1.42 (empty = latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the image already exists"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "image/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ inputs.version || 'latest' }}
+  cancel-in-progress: false
+
+env:
+  FW_API: https://fw-update.ui.com/api
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      url: ${{ steps.release.outputs.url }}
+      sha256: ${{ steps.release.outputs.sha256 }}
+      is_latest: ${{ steps.release.outputs.is_latest }}
+      image: ${{ steps.release.outputs.image }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Find the release
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          filter='filter=eq~~product~~unifi-os-server&filter=eq~~platform~~linux-x64'
+          latest_json="$(curl -fsSL "${FW_API}/firmware-latest?${filter}&filter=eq~~channel~~release")"
+          latest="$(jq -r '._embedded.firmware[0].version' <<<"${latest_json}" | sed 's/^v//')"
+
+          version="${INPUT_VERSION#v}"
+          if [[ -z "${version}" || "${version}" == "${latest}" ]]; then
+            version="${latest}"
+            fw="$(jq '._embedded.firmware[0]' <<<"${latest_json}")"
+          else
+            fw="$(curl -fsSL "${FW_API}/firmware?${filter}&filter=eq~~version~~v${version}" | jq '._embedded.firmware[0]')"
+          fi
+          [[ "${version}" =~ ^[0-9]+(\.[0-9]+)+$ && "${fw}" != "null" ]] || { echo "Release ${version} not found"; exit 1; }
+
+          {
+            echo "version=${version}"
+            echo "url=$(jq -r '._links.data.href' <<<"${fw}")"
+            echo "sha256=$(jq -r '.sha256_checksum' <<<"${fw}")"
+            echo "is_latest=$([[ "${version}" == "${latest}" ]] && echo true || echo false)"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/unifi-os-server"
+          } >> "$GITHUB_OUTPUT"
+          echo "UniFi OS Server ${version} (latest release: ${latest})"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Decide
+        id: decide
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION: ${{ steps.release.outputs.version }}
+          FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "${FORCE}" == "true" || "${EVENT}" == "push" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "${IMAGE}:${VERSION} already exists"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      IMAGE: ${{ needs.check.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the official installer
+        env:
+          URL: ${{ needs.check.outputs.url }}
+          SHA256: ${{ needs.check.outputs.sha256 }}
+        run: |
+          curl -fsSL -o uos-installer "${URL}"
+          echo "${SHA256}  uos-installer" | sha256sum -c -
+          chmod +x uos-installer
+
+      - name: Install UniFi OS Server (official installer, Podman)
+        run: |
+          mkdir -p "$HOME/.config/containers"
+          chmod 755 "$HOME" "$HOME/.config" "$HOME/.config/containers"
+          touch "$HOME/.config/containers/storage.conf"
+          chmod 755 "$HOME/.config/containers/storage.conf"
+          echo "y" | sudo ./uos-installer
+          sudo systemctl stop uosserver 2>/dev/null || true
+
+      - name: Take the original uosserver image from Podman
+        run: |
+          store="$HOME/.local/share/containers/storage"
+          for d in overlay overlay-images overlay-layers; do
+            mkdir -p "${store}/${d}"
+            sudo cp -a "/home/uosserver/.local/share/containers/storage/${d}/." "${store}/${d}/"
+          done
+          sudo chown -R "$(id -u):$(id -g)" "${store}"
+          podman images uosserver
+          id="$(podman images uosserver --noheading --format '{{.ID}}' | head -n 1)"
+          [[ -n "${id}" ]] || { echo "uosserver image not found"; exit 1; }
+          podman save --format docker-archive -o uosserver.tar "${id}"
+          docker load -i uosserver.tar | tee load.log
+          base="$(sed -n 's/^Loaded image ID: //p; s/^Loaded image: //p' load.log | tail -n 1)"
+          docker tag "${base}" "uosserver-base:${VERSION}"
+          rm -f uosserver.tar
+
+      - name: Build the image
+        run: |
+          docker build image \
+            --build-arg "BASE_IMAGE=uosserver-base:${VERSION}" \
+            --build-arg "UOS_VERSION=${VERSION}" \
+            --build-arg "SOURCE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "${IMAGE}:${VERSION}"
+
+      - name: Smoke test (UniFi OS must come up)
+        run: |
+          docker run -d --name uos-test --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --cap-add NET_RAW --cap-add NET_ADMIN \
+            --tmpfs /run:exec --tmpfs /run/lock --tmpfs /tmp:exec --tmpfs /var/lib/journal \
+            --tmpfs /var/opt/unifi/tmp:size=64m \
+            -e UOS_SYSTEM_IP=127.0.0.1 \
+            "${IMAGE}:${VERSION}"
+          ok=false
+          for _ in $(seq 1 60); do
+            sleep 10
+            core="$(docker exec uos-test systemctl is-active unifi-core 2>/dev/null || true)"
+            code="$(docker exec uos-test curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/ 2>/dev/null || true)"
+            echo "unifi-core=${core} https=${code}"
+            if [[ "${core}" == "active" && "${code}" =~ ^(200|301|302)$ ]]; then ok=true; break; fi
+          done
+          docker logs uos-test 2>&1 | tail -n 30
+          docker exec uos-test cat /usr/lib/version || true
+          [[ "${ok}" == "true" ]]
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push
+        env:
+          IS_LATEST: ${{ needs.check.outputs.is_latest }}
+        run: |
+          docker push "${IMAGE}:${VERSION}"
+          if [[ "${IS_LATEST}" == "true" ]]; then
+            docker tag "${IMAGE}:${VERSION}" "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi
+          echo "Published ${IMAGE}:${VERSION}" >> "$GITHUB_STEP_SUMMARY"

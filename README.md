@@ -2,10 +2,10 @@
 
 [UniFi OS Server](https://help.ui.com/hc/en-us/articles/34210126298775-Self-Hosting-UniFi) — официальный способ держать UniFi (Network и другие приложения) на своём сервере. Он заменяет отдельный UniFi Network Application: версия 10.6 стала последней в таком виде.
 
-Этот проект запускает UniFi OS Server в Container Manager на Synology и **сам обновляет его при выходе новых версий** — с бэкапом и автоматическим откатом при сбое.
+Этот проект запускает UniFi OS Server в Container Manager на Synology и обновляет его **автоматически при выходе новых версий** или **по кнопке «Обновить» в консоли UniFi OS** — с бэкапом и автоматическим откатом при сбое.
 
-- Образ UniFi OS Server — [`ghcr.io/lemker/unifi-os-server`](https://github.com/lemker/unifi-os-server). Его собирают из официального установщика Ubiquiti, и он умеет работать на Synology DSM (сам применяет нужные исправления). Новый выпуск образа появляется в течение часа после выхода новой версии UniFi OS Server.
-- Контейнер `unifi-os-updater` (из этого репозитория) каждую ночь проверяет выпуски образа и обновляет сервер.
+- Образ `ghcr.io/sinitsada/unifi-os-server:<версия>` собирается в этом репозитории (GitHub Actions) **из официального установщика Ubiquiti**: из установщика берётся оригинальный образ UniFi OS Server, к нему добавляется только точка входа с исправлениями для Synology DSM. Тег образа = версия UniFi OS Server (`5.1.42`). Новая версия собирается в течение 3 часов после выхода — см. [Как собирается образ](#как-собирается-образ).
+- Контейнер `unifi-os-updater` обновляет сервер: каждую ночь по расписанию и сразу после нажатия «Обновить» в консоли UniFi OS. Для консоли он играет роль «UOS Server Manager» — той же службы, что ставит официальный установщик.
 
 ## Содержание
 
@@ -16,11 +16,13 @@
 - [Обновления](#обновления)
 - [Бэкапы и восстановление](#бэкапы-и-восстановление)
 - [Настройки (.env)](#настройки-env)
+- [Как собирается образ](#как-собирается-образ)
+- [Переход с образа lemker](#переход-с-образа-lemker)
 - [Устранение неполадок](#устранение-неполадок)
 
 ## Требования
 
-- Synology с **DSM 7.2+** и пакетом **Container Manager**, процессор x86_64 (Intel/AMD) или ARM64.
+- Synology с **DSM 7.2+** и пакетом **Container Manager**, процессор **x86_64** (Intel/AMD). Подойдёт и любой Linux с Docker (например, виртуальная машина).
 - **Не меньше 4 ГБ памяти**, лучше 8 ГБ и больше: UniFi OS запускает внутри MongoDB, PostgreSQL, RabbitMQ и сами приложения.
 - Около 10 ГБ на диске (образ ~2 ГБ, данные, бэкапы).
 - Постоянный IP-адрес NAS в локальной сети: по нему устройства UniFi подключаются к серверу.
@@ -35,7 +37,7 @@
 docker/unifi-os-server/
 ├── compose.yaml
 ├── .env              (из .env.example, см. шаг 2)
-├── updater/          (Dockerfile, entrypoint.sh, update.sh, restore.sh)
+├── updater/          (Dockerfile, supervisor.js, lib.sh, entrypoint.sh, update.sh, console-update.sh, restore.sh)
 └── backups/          (пустая папка — сюда пишутся бэкапы)
 ```
 
@@ -103,18 +105,29 @@ set-inform http://<IP NAS>:8080/inform
 
 ## Обновления
 
-**UniFi OS Server** обновляет контейнер `unifi-os-updater`. Он проверяет обновления при запуске и каждый день в `UPDATE_TIME`:
+UniFi OS Server обновляется двумя способами (оба включены по умолчанию):
 
-1. Находит последний выпуск образа [lemker/unifi-os-server](https://github.com/lemker/unifi-os-server/releases) и ждёт, пока ему исполнится `MIN_AGE_DAYS` дней.
-2. Скачивает новый образ, пока работает текущая версия.
-3. Останавливает сервер и делает **полный бэкап** папки `data` (базы данных копируются только у остановленного сервера) в `backups/`.
-4. Запускает новую версию и ждёт до 15 минут, пока поднимется UniFi OS: служба `unifi-core` и веб-интерфейс.
-5. **Если не поднялась, восстанавливает бэкап и прежнюю версию.**
-6. Удаляет старые образы и бэкапы сверх `KEEP_BACKUPS`.
+**1. По кнопке в консоли UniFi OS** (`CONSOLE_UPDATE=1`). Когда в консоли появляется новая версия UniFi OS Server, нажмите **«Обновить»** как на обычной консоли UniFi:
 
-Журнал пишется в `update.log` и в журнал контейнера `unifi-os-updater`.
+1. UniFi OS скачивает установщик новой версии с серверов Ubiquiti, проверяет его и передаёт команду обновления «UOS Server Manager» — в официальной установке это служба на хосте.
+2. Здесь эту роль играет `supervisor.js` в контейнере `unifi-os-updater`: он подключён к UniFi OS по тому же протоколу (UCP4, `wss://unifi-os-server:11084`) и записывает запрос с версией в `/uos/boot/uos-update.json`.
+3. `console-update.sh` (проверка каждые 15 секунд) выполняет обычное обновление ниже на образ этой версии: бэкап, новый образ, проверка, откат при сбое. Консоль недоступна 3–5 минут.
 
-**Приложения внутри UniFi OS** (Network и другие) обновляются как обычно, из веб-интерфейса UniFi OS: Settings → Updates. Там же можно включить их автообновление.
+Если образ только что вышедшей версии ещё не собран, обновитель повторяет попытку каждые 15 минут. С `GITHUB_TOKEN` в `.env` он сразу запускает сборку этой версии на GitHub, не дожидаясь расписания.
+
+**2. Автоматически** (`AUTO_UPDATE=1`). При запуске и каждый день в `UPDATE_TIME` обновитель узнаёт у Ubiquiti последнюю версию UniFi OS Server и ставит её, когда ей исполнится `MIN_AGE_DAYS` дней и её образ опубликован.
+
+**Как проходит обновление:**
+
+1. Скачивается новый образ, пока работает текущая версия.
+2. Сервер останавливается, данные полностью копируются в `backups/` (базы данных копируются только у остановленного сервера).
+3. Запускается новая версия; обновитель ждёт до 15 минут, пока поднимется UniFi OS (служба `unifi-core` и веб-интерфейс).
+4. **Если не поднялась — восстанавливает бэкап и прежнюю версию.**
+5. Удаляет старые образы и бэкапы сверх `KEEP_BACKUPS`.
+
+Журнал — `update.log` и журнал контейнера `unifi-os-updater`.
+
+**Приложения внутри UniFi OS** (Network и другие) обновляются как обычно, из веб-интерфейса UniFi OS: Settings → Updates.
 
 Ручное управление (SSH):
 
@@ -122,36 +135,61 @@ set-inform http://<IP NAS>:8080/inform
 sudo docker exec unifi-os-updater update.sh                                 # проверить сейчас
 sudo docker exec -e MIN_AGE_DAYS=0 unifi-os-updater update.sh               # поставить свежий выпуск сразу
 sudo docker exec -e DRY_RUN=1 -e MIN_AGE_DAYS=0 unifi-os-updater update.sh  # только показать
-sudo docker exec -e FORCE_TAG=v1.6.0 unifi-os-updater update.sh             # перейти на конкретный выпуск
+sudo docker exec -e FORCE_VERSION=5.1.42 unifi-os-updater update.sh         # перейти на конкретную версию
 ```
-
-Не обновляйте сам UniFi OS Server из его веб-интерфейса: в контейнере это не сработает. Его обновляет `unifi-os-updater`.
 
 ## Бэкапы и восстановление
 
-- **Бэкапы контейнера**: `backups/data_<выпуск>_<дата>.tar.gz` — полная копия данных перед каждым обновлением (сервер в этот момент остановлен, поэтому базы данных копируются целостно).
+- **Бэкапы контейнера**: `backups/data_<версия>_<дата>.tar.gz` — полная копия данных перед каждым обновлением (сервер в этот момент остановлен, поэтому базы данных копируются целостно).
 - **Бэкапы UniFi**: настройте в самом UniFi OS (Settings → Backups). Файлы `.unf` можно перенести на любой другой контроллер.
 
-Восстановить бэкап контейнера (запустится тот выпуск образа, на котором сделан бэкап):
+Восстановить бэкап контейнера (запустится та версия UniFi OS Server, на которой сделан бэкап):
 
 ```bash
 sudo docker exec unifi-os-updater restore.sh                                  # список бэкапов
-sudo docker exec unifi-os-updater restore.sh data_v1.7.0_2026-10-06_16-17-31.tar.gz
+sudo docker exec unifi-os-updater restore.sh data_5.1.42_2026-10-07_04-30-12.tar.gz
 ```
 
 ## Настройки (.env)
 
 | Параметр | По умолчанию | Описание |
 |---|---|---|
-| `UOS_IMAGE_TAG` | — | выпуск образа lemker, **меняется автоматически** |
+| `UOS_VERSION` | — | версия UniFi OS Server (тег образа), **меняется автоматически** |
+| `UOS_IMAGE` | `ghcr.io/sinitsada/unifi-os-server` | образ (свой, если собираете в своём форке) |
+| `UOS_WEB_PORT` | `11443` | порт веб-интерфейса UniFi OS |
 | `UOS_SYSTEM_IP` | — | IP или имя NAS для подключения устройств |
 | `UOS_DIR` | — | точный путь к папке проекта |
 | `COMPOSE_PROJECT_NAME` | `unifi-os-server` | имя проекта |
 | `TZ` | `UTC` | часовой пояс |
+| `AUTO_UPDATE` | `1` | ежедневная проверка и установка новых выпусков |
+| `CONSOLE_UPDATE` | `1` | обновление по кнопке «Обновить» в консоли UniFi OS |
 | `UPDATE_TIME` | `04:30` | время ежедневной проверки |
 | `MIN_AGE_DAYS` | `2` | ставить выпуск, когда ему исполнится столько дней (`0` — сразу) |
 | `KEEP_BACKUPS` | `5` | сколько бэкапов хранить |
 | `HEALTH_TIMEOUT` | `900` | сколько секунд ждать запуска после обновления |
+| `GITHUB_TOKEN` | — | необязательно: токен с правом `actions:write` на репозиторий образа, чтобы сразу запускать сборку версии, запрошенной из консоли |
+
+## Как собирается образ
+
+Сборка — [.github/workflows/build.yml](.github/workflows/build.yml), запускается каждые 3 часа (и вручную: Actions → Build image → Run workflow, можно указать версию):
+
+1. Через API Ubiquiti (`fw-update.ui.com`) узнаёт последнюю версию UniFi OS Server для linux-x64; если образ этой версии уже есть — ничего не делает.
+2. Скачивает **официальный установщик** с серверов Ubiquiti и сверяет его SHA-256.
+3. Запускает установщик на чистой Ubuntu: он ставит UniFi OS Server в Podman. Оттуда берётся оригинальный образ `uosserver`.
+4. Добавляет к нему точку входа [image/uos-entrypoint.sh](image/uos-entrypoint.sh) — исправления для Synology DSM (cgroup v1, systemd-службы PostgreSQL, RabbitMQ, ulp-go) и настройку адреса для устройств.
+5. Запускает получившийся образ и ждёт, пока UniFi OS поднимется. Только после этого публикует `ghcr.io/sinitsada/unifi-os-server:<версия>` и `:latest`.
+
+Своя сборка в форке: сделайте форк, включите Actions, после первой сборки откройте пакет `unifi-os-server` (Packages) → Package settings → **Change visibility → Public**, и укажите `UOS_IMAGE=ghcr.io/<ваш логин>/unifi-os-server` в `.env`.
+
+## Переход с образа lemker
+
+Если проект уже работает на `ghcr.io/lemker/unifi-os-server` из прежней версии этого репозитория, данные (тома Docker) остаются те же:
+
+1. Обновите файлы проекта из репозитория (`compose.yaml`, `updater/`).
+2. В `.env` замените `UOS_IMAGE_TAG=v1.7.0` на `UOS_VERSION=5.1.42` — **ту же версию UniFi OS Server**, что работает сейчас, — и добавьте строки `UOS_IMAGE`, `UOS_WEB_PORT`, `GITHUB_TOKEN` из [.env.example](.env.example).
+3. Container Manager → проект → **Остановить**, затем **Собрать** (или `sudo docker compose up -d --build`).
+
+Старые бэкапы `data_v1.x.x_*.tar.gz` сделаны на образе lemker, `restore.sh` их не восстанавливает.
 
 ## Устранение неполадок
 
@@ -161,9 +199,11 @@ sudo docker exec unifi-os-updater restore.sh data_v1.7.0_2026-10-06_16-17-31.tar
 | Веб-интерфейс не открывается сразу после запуска | подождите 5–10 минут; ход запуска: `sudo docker exec unifi-os-server systemctl --type=service --state=activating,failed` |
 | `address already in use` | порт занят старым контроллером или другим контейнером |
 | После перезапуска устройства «не в сети» | подождите несколько минут; проверьте, что `UOS_SYSTEM_IP` — адрес NAS |
+| «Обновить» в консоли заканчивается ошибкой загрузки | UniFi OS не может скачать установщик: `fw-download.ubnt.com` отвечает `451 you have been blocked` для IP-адресов некоторых стран. Пустите `fw-download.ubnt.com` через VPN/VPS на роутере или обновляйте без консоли: `sudo docker exec -e MIN_AGE_DAYS=0 unifi-os-updater update.sh` (образы берутся с ghcr.io) |
+| Нет строки `Connected to UniFi OS` в `sudo docker logs unifi-os-updater` | проверьте, что `CONSOLE_UPDATE=1` и контейнер `unifi-os-server` запущен; обновитель переподключается каждые 15 секунд |
 
 ## Благодарности и лицензии
 
-- UniFi OS Server — проприетарное ПО Ubiquiti Inc.
-- Образ для Docker — [lemker/unifi-os-server](https://github.com/lemker/unifi-os-server).
-- Этот репозиторий — только файлы развёртывания и автообновление.
+- UniFi OS Server — проприетарное ПО Ubiquiti Inc. Образ содержит его в том виде, в каком его ставит официальный установщик.
+- Способ сборки и точка входа с исправлениями для Synology ([image/uos-entrypoint.sh](image/uos-entrypoint.sh)) — из [lemker/unifi-os-server](https://github.com/lemker/unifi-os-server) (© lemker, AGPL-3.0).
+- Этот репозиторий распространяется по лицензии [AGPL-3.0](LICENSE).

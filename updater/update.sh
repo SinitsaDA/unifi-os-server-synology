@@ -1,152 +1,85 @@
 #!/bin/bash
 #
-# Updates UniFi OS Server to the latest release of github.com/lemker/unifi-os-server
-# (each release bundles one UniFi OS Server version extracted from the official installer).
+# Updates UniFi OS Server to another version of the image ghcr.io/sinitsada/unifi-os-server
+# (built from the official installer by .github/workflows/build.yml, tag = UniFi OS Server version).
 #
-#   docker exec unifi-os-updater update.sh                                  regular check
-#   docker exec -e MIN_AGE_DAYS=0 unifi-os-updater update.sh                install a fresh release now
-#   docker exec -e FORCE_TAG=v1.7.0 unifi-os-updater update.sh              switch to exactly this release
-#   docker exec -e DRY_RUN=1 -e MIN_AGE_DAYS=0 unifi-os-updater update.sh   only report
+#   docker exec unifi-os-updater update.sh                                    regular check
+#   docker exec -e MIN_AGE_DAYS=0 unifi-os-updater update.sh                  install a fresh release now
+#   docker exec -e FORCE_VERSION=5.1.42 unifi-os-updater update.sh            switch to exactly this version
+#   docker exec -e DRY_RUN=1 -e MIN_AGE_DAYS=0 unifi-os-updater update.sh     only report
 #
 # Steps: pull the new image while the current version runs -> stop UniFi OS -> back up the data ->
 # start the new image -> wait until UniFi OS is up -> otherwise restore the backup and the old image.
 # Apps inside UniFi OS (Network, ...) update themselves from the UniFi OS web interface.
 
-UOS_DIR=${UOS_DIR:-/volume1/docker/unifi-os-server}
+# shellcheck source=lib.sh
+source /usr/local/bin/lib.sh
+
 MIN_AGE_DAYS=${MIN_AGE_DAYS:-2}
 KEEP_BACKUPS=${KEEP_BACKUPS:-5}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-900}
 ROLLBACK_TIMEOUT=${ROLLBACK_TIMEOUT:-900}
 DRY_RUN=${DRY_RUN:-0}
 
-REPO=lemker/unifi-os-server
-IMAGE=ghcr.io/lemker/unifi-os-server
-SERVICE=unifi-os-server
-CONTAINER=unifi-os-server
-
-ENV_FILE="${UOS_DIR}/.env"
-BACKUP_DIR="${UOS_DIR}/backups"
-LOG_FILE="${UOS_DIR}/update.log"
-LOCK_DIR="${UOS_DIR}/.update.lock"
-
-# Data volumes as mounted into the updater (var-log is not backed up).
-VOLUMES_DIR=/uos
-DATA_VOLUMES=(persistent data srv var-lib-unifi var-lib-mongodb etc-rabbitmq-ssl)
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "${LOG_FILE}"
-}
-
-fail() {
-    log "ERROR: $*"
-    exit 1
-}
-
 if [[ ! -f "${ENV_FILE}" ]]; then
     echo "ERROR: ${ENV_FILE} not found - UOS_DIR in .env must be the real path of the project"
     exit 1
 fi
 cd "${UOS_DIR}" || exit 1
-
-COMPOSE="docker compose --project-directory ${UOS_DIR}"
-# Use the project name of the running server (Synology Container Manager names projects itself).
-PROJECT_NAME="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "${CONTAINER}" 2>/dev/null)"
-[[ -n "${PROJECT_NAME}" ]] && COMPOSE="${COMPOSE} -p ${PROJECT_NAME}"
+COMPOSE="$(compose_cmd)"
 
 if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
     fail "another update is running (remove ${LOCK_DIR} if it is stale)"
 fi
 trap 'rmdir "${LOCK_DIR}" 2>/dev/null' EXIT
 
-set_tag() {
-    sed -i "s/^UOS_IMAGE_TAG=.*/UOS_IMAGE_TAG=$1/" "${ENV_FILE}"
-}
+# ---------- Target version ----------
 
-# uos_version <image>: UniFi OS Server version bundled in the image
-uos_version() {
-    docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null |
-        sed -n 's/^APP_VERSION=//p'
-}
+CURRENT="$(current_version)"
+[[ -n "${CURRENT}" ]] || fail "UOS_VERSION is not set in ${ENV_FILE}"
 
-# healthy: systemd is up, the UniFi OS core service is active and the web server answers
-healthy() {
-    [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null)" == "true" ]] || return 1
-    [[ "$(docker exec "${CONTAINER}" systemctl is-active unifi-core 2>/dev/null)" == "active" ]] || return 1
-    local code
-    code="$(docker exec "${CONTAINER}" curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/ 2>/dev/null)"
-    [[ "${code}" =~ ^(200|301|302)$ ]]
-}
-
-# wait_healthy <timeout>
-wait_healthy() {
-    local deadline=$((SECONDS + $1))
-    while (( SECONDS < deadline )); do
-        sleep 15
-        healthy && return 0
-    done
-    return 1
-}
-
-# restore_backup <archive>: replaces the contents of the data volumes with the archive
-restore_backup() {
-    local volume
-    for volume in "${DATA_VOLUMES[@]}"; do
-        find "${VOLUMES_DIR}/${volume}" -mindepth 1 -delete || return 1
-    done
-    tar -xzf "$1" --numeric-owner -C "${VOLUMES_DIR}"
-}
-
-# ---------- Target release ----------
-
-CURRENT="$(sed -n 's/^UOS_IMAGE_TAG=//p' "${ENV_FILE}" | tr -d '[:space:]')"
-[[ -n "${CURRENT}" ]] || fail "UOS_IMAGE_TAG is not set in ${ENV_FILE}"
-
-if [[ -n "${FORCE_TAG}" ]]; then
-    TARGET="${FORCE_TAG}"
-    log "Forced release: ${TARGET}"
+if [[ -n "${FORCE_VERSION}" ]]; then
+    TARGET="${FORCE_VERSION#v}"
+    log "Forced version: ${TARGET}"
 else
-    RELEASE="$(curl -fsSL --max-time 30 "https://api.github.com/repos/${REPO}/releases/latest")" ||
-        fail "unable to get the latest release of ${REPO}"
-    TARGET="$(echo "${RELEASE}" | jq -r '.tag_name // empty')"
-    PUBLISHED="$(echo "${RELEASE}" | jq -r '.published_at // empty')"
-    [[ -n "${TARGET}" ]] || fail "unable to parse the latest release"
+    read -r TARGET CREATED < <(latest_release) || true
+    [[ -n "${TARGET}" ]] || fail "unable to get the latest UniFi OS Server release from ${FW_API}"
 
-    if [[ "${TARGET}" == "${CURRENT}" ]]; then
-        log "UniFi OS Server image ${CURRENT} is up to date"
+    if ! version_newer "${TARGET}" "${CURRENT}"; then
+        log "UniFi OS Server ${CURRENT} is up to date"
         exit 0
     fi
 
-    NEWEST="$(printf '%s\n%s\n' "${CURRENT#v}" "${TARGET#v}" | sort -V | tail -n 1)"
-    if [[ "v${NEWEST}" != "${TARGET}" && "${NEWEST}" != "${TARGET}" ]]; then
-        log "Installed ${CURRENT} is newer than the latest release ${TARGET}, nothing to do"
-        exit 0
-    fi
-
-    AGE_DAYS=$(( ($(date +%s) - $(date -d "${PUBLISHED}" +%s)) / 86400 ))
+    AGE_DAYS=$(( ($(date +%s) - $(date -d "${CREATED}" +%s)) / 86400 ))
     if (( AGE_DAYS < MIN_AGE_DAYS )); then
-        log "Release ${TARGET} is ${AGE_DAYS} day(s) old, it will be installed when it is ${MIN_AGE_DAYS} day(s) old"
+        log "UniFi OS Server ${TARGET} is ${AGE_DAYS} day(s) old, it will be installed when it is ${MIN_AGE_DAYS} day(s) old"
         exit 0
     fi
 fi
 
-[[ "${TARGET}" =~ ^v?[0-9]+(\.[0-9]+)+$ ]] || fail "unexpected release tag: ${TARGET}"
+[[ "${TARGET}" =~ ^[0-9]+(\.[0-9]+)+$ ]] || fail "unexpected version: ${TARGET}"
 
 if [[ "${TARGET}" == "${CURRENT}" ]]; then
-    log "Release ${CURRENT} is already installed"
+    log "UniFi OS Server ${CURRENT} is already installed"
+    exit 0
+fi
+
+if ! image_exists "${TARGET}"; then
+    log "Image ${UOS_IMAGE}:${TARGET} is not published yet, staying on ${CURRENT}"
     exit 0
 fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-    log "DRY_RUN: would update ${CURRENT} -> ${TARGET}"
+    log "DRY_RUN: would update UniFi OS Server ${CURRENT} -> ${TARGET}"
     exit 0
 fi
 
 # ---------- Pull while the current version keeps running ----------
 
-if ! UOS_IMAGE_TAG="${TARGET}" ${COMPOSE} pull --quiet "${SERVICE}" >>"${LOG_FILE}" 2>&1; then
-    fail "unable to pull ${IMAGE}:${TARGET}, staying on ${CURRENT}"
+if ! UOS_VERSION="${TARGET}" ${COMPOSE} pull --quiet "${SERVICE}" >>"${LOG_FILE}" 2>&1; then
+    fail "unable to pull ${UOS_IMAGE}:${TARGET}, staying on ${CURRENT}"
 fi
-log "Updating ${CURRENT} -> ${TARGET} (UniFi OS Server $(uos_version "${IMAGE}:${CURRENT}") -> $(uos_version "${IMAGE}:${TARGET}"))"
+log "Updating UniFi OS Server ${CURRENT} -> ${TARGET}"
 
 # ---------- Backup ----------
 
@@ -163,11 +96,12 @@ if ! tar -I 'gzip -1' --numeric-owner -cf "${BACKUP}" -C "${VOLUMES_DIR}" "${DAT
 fi
 log "Backup done ($(du -h "${BACKUP}" | cut -f1))"
 
-ls -1t "${BACKUP_DIR}"/data_*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f
+find "${BACKUP_DIR}" -maxdepth 1 -name 'data_*.tar.gz' -printf '%T@ %p\n' | sort -rn |
+    tail -n +$((KEEP_BACKUPS + 1)) | cut -d' ' -f2- | xargs -r rm -f
 
 # ---------- Start the new version ----------
 
-set_tag "${TARGET}"
+set_version "${TARGET}"
 ${COMPOSE} up -d --no-deps "${SERVICE}" >>"${LOG_FILE}" 2>&1
 
 log "Waiting up to ${HEALTH_TIMEOUT}s for UniFi OS to start"
@@ -177,10 +111,8 @@ else
     log "ERROR: UniFi OS Server ${TARGET} did not start in ${HEALTH_TIMEOUT}s, rolling back to ${CURRENT}"
     docker logs --tail 40 "${CONTAINER}" >>"${LOG_FILE}" 2>&1
     ${COMPOSE} stop "${SERVICE}" >>"${LOG_FILE}" 2>&1
-
     restore_backup "${BACKUP}" || fail "unable to restore ${BACKUP}, restore it manually"
-
-    set_tag "${CURRENT}"
+    set_version "${CURRENT}"
     ${COMPOSE} up -d --no-deps "${SERVICE}" >>"${LOG_FILE}" 2>&1
     if wait_healthy "${ROLLBACK_TIMEOUT}"; then
         fail "rolled back to ${CURRENT}"
@@ -191,9 +123,9 @@ fi
 
 # ---------- Cleanup: keep the running image and the previous one ----------
 
-docker images "${IMAGE}" --format '{{.Tag}}' | grep -vxE "${TARGET}|${CURRENT}|<none>" |
+docker images "${UOS_IMAGE}" --format '{{.Tag}}' | grep -vxE "${TARGET//./\\.}|${CURRENT//./\\.}|latest|<none>" |
     while read -r tag; do
-        docker rmi "${IMAGE}:${tag}" >>"${LOG_FILE}" 2>&1 && log "Removed image ${IMAGE}:${tag}"
+        docker rmi "${UOS_IMAGE}:${tag}" >>"${LOG_FILE}" 2>&1 && log "Removed image ${UOS_IMAGE}:${tag}"
     done
 docker image prune -f >>"${LOG_FILE}" 2>&1
 

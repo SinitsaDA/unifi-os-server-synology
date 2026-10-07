@@ -1,20 +1,15 @@
 #!/bin/bash
 #
-# Restores UniFi OS Server from a backup made by update.sh and starts the image release the backup
-# was made with (taken from the file name: data_<release>_<date>.tar.gz).
+# Restores UniFi OS Server from a backup made by update.sh and starts the UniFi OS Server version
+# the backup was made with (taken from the file name: data_<version>_<date>.tar.gz).
 #
 #   docker exec unifi-os-updater restore.sh                          list the backups
 #   docker exec unifi-os-updater restore.sh <archive>                restore (name or path)
 
-UOS_DIR=${UOS_DIR:-/volume1/docker/unifi-os-server}
-HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-900}
+# shellcheck source=lib.sh
+source /usr/local/bin/lib.sh
 
-SERVICE=unifi-os-server
-CONTAINER=unifi-os-server
-ENV_FILE="${UOS_DIR}/.env"
-BACKUP_DIR="${UOS_DIR}/backups"
-VOLUMES_DIR=/uos
-DATA_VOLUMES=(persistent data srv var-lib-unifi var-lib-mongodb etc-rabbitmq-ssl)
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-900}
 
 cd "${UOS_DIR}" || exit 1
 
@@ -29,33 +24,26 @@ ARCHIVE="$1"
 [[ -f "${ARCHIVE}" ]] || ARCHIVE="${BACKUP_DIR}/$1"
 [[ -f "${ARCHIVE}" ]] || { echo "Backup not found: $1"; exit 1; }
 
-TAG="$(basename "${ARCHIVE}" | sed -n 's/^data_\(v[0-9.]*\)_.*/\1/p')"
-[[ -n "${TAG}" ]] || { echo "Unable to get the release from the file name: ${ARCHIVE}"; exit 1; }
+VERSION="$(basename "${ARCHIVE}" | sed -n 's/^data_\([0-9][0-9.]*[0-9]\)_.*/\1/p')"
+[[ -n "${VERSION}" ]] || { echo "Unable to get the version from the file name: ${ARCHIVE}"; exit 1; }
 
-COMPOSE="docker compose --project-directory ${UOS_DIR}"
-PROJECT_NAME="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "${CONTAINER}" 2>/dev/null)"
-[[ -n "${PROJECT_NAME}" ]] && COMPOSE="${COMPOSE} -p ${PROJECT_NAME}"
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    echo "An update is running (remove ${LOCK_DIR} if it is stale)"
+    exit 1
+fi
+trap 'rmdir "${LOCK_DIR}" 2>/dev/null' EXIT
 
-echo "Restoring ${ARCHIVE} (release ${TAG})"
+COMPOSE="$(compose_cmd)"
+
+log "Restoring ${ARCHIVE} (UniFi OS Server ${VERSION})"
 ${COMPOSE} stop "${SERVICE}"
-
-for volume in "${DATA_VOLUMES[@]}"; do
-    find "${VOLUMES_DIR}/${volume}" -mindepth 1 -delete || exit 1
-done
-tar -xzf "${ARCHIVE}" --numeric-owner -C "${VOLUMES_DIR}" || { echo "Unable to extract ${ARCHIVE}"; exit 1; }
-
-sed -i "s/^UOS_IMAGE_TAG=.*/UOS_IMAGE_TAG=${TAG}/" "${ENV_FILE}"
+restore_backup "${ARCHIVE}" || fail "unable to restore ${ARCHIVE}"
+set_version "${VERSION}"
 ${COMPOSE} up -d --no-deps "${SERVICE}"
 
 echo "Waiting up to ${HEALTH_TIMEOUT}s for UniFi OS to start..."
-deadline=$((SECONDS + HEALTH_TIMEOUT))
-while (( SECONDS < deadline )); do
-    sleep 15
-    if [[ "$(docker exec "${CONTAINER}" systemctl is-active unifi-core 2>/dev/null)" == "active" ]]; then
-        echo "Restored: UniFi OS Server ${TAG} is running."
-        exit 0
-    fi
-done
-
-echo "UniFi OS did not start in ${HEALTH_TIMEOUT}s, check: docker logs ${CONTAINER}"
-exit 1
+if wait_healthy "${HEALTH_TIMEOUT}"; then
+    log "Restored: UniFi OS Server ${VERSION} is running"
+else
+    fail "UniFi OS did not start in ${HEALTH_TIMEOUT}s, check: docker logs ${CONTAINER}"
+fi

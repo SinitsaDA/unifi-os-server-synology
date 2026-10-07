@@ -1,4 +1,5 @@
-# UniFi OS Server (image by github.com/lemker/unifi-os-server) with automatic updates.
+# UniFi OS Server (Ubiquiti) in Docker with automatic updates and "Update" from the UniFi OS console.
+# Image: built from the official installer by .github/workflows/build.yml, tag = UniFi OS Server version.
 # Settings: .env (copy .env.example). Documentation: README.md
 #
 # The data lives in Docker volumes (/volume1/@docker/volumes on Synology), not in a shared
@@ -6,7 +7,7 @@
 
 services:
   unifi-os-server:
-    image: ghcr.io/lemker/unifi-os-server:${UOS_IMAGE_TAG:?set UOS_IMAGE_TAG in .env}
+    image: ${UOS_IMAGE:-ghcr.io/sinitsada/unifi-os-server}:${UOS_VERSION:?set UOS_VERSION in .env}
     container_name: unifi-os-server
     hostname: unifi-os-server
     # UniFi OS runs systemd inside; on Synology DSM (cgroup v1) the image applies its patches.
@@ -35,7 +36,7 @@ services:
       - var-lib-mongodb:/var/lib/mongodb
       - etc-rabbitmq-ssl:/etc/rabbitmq/ssl
     ports:
-      - 11443:443          # UniFi OS web interface (443 is used by DSM)
+      - ${UOS_WEB_PORT:-11443}:443   # UniFi OS web interface (443 is used by DSM)
       - 8080:8080          # device inform
       - 3478:3478/udp      # STUN
       - 10003:10003/udp    # device discovery
@@ -48,11 +49,10 @@ services:
       - 5005:5005          # RTP control
       - 9543:9543          # identity hub
       - 5671:5671          # AMQPS
-      - 127.0.0.1:11084:11084
     stop_grace_period: 2m
     restart: unless-stopped
 
-  # Checks for new image releases every day and updates UniFi OS Server:
+  # Updates UniFi OS Server every day and when "Update" is pressed in the UniFi OS console:
   # backup of all data -> new version -> health check -> automatic rollback on failure.
   updater:
     build: ./updater
@@ -60,11 +60,17 @@ services:
     container_name: unifi-os-updater
     environment:
       UOS_DIR: ${UOS_DIR}
+      UOS_IMAGE: ${UOS_IMAGE:-ghcr.io/sinitsada/unifi-os-server}
+      UOS_WEB_PORT: ${UOS_WEB_PORT:-11443}
+      # Optional: GitHub token (actions:write) to start the image build of a version that is not built yet.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       TZ: ${TZ:-UTC}
       UPDATE_TIME: ${UPDATE_TIME:-04:30}
       MIN_AGE_DAYS: ${MIN_AGE_DAYS:-2}
       KEEP_BACKUPS: ${KEEP_BACKUPS:-5}
       HEALTH_TIMEOUT: ${HEALTH_TIMEOUT:-900}
+      AUTO_UPDATE: ${AUTO_UPDATE:-1}
+      CONSOLE_UPDATE: ${CONSOLE_UPDATE:-1}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mounted at the same path as on the host, so compose resolves the project identically.
@@ -76,6 +82,8 @@ services:
       - var-lib-unifi:/uos/var-lib-unifi
       - var-lib-mongodb:/uos/var-lib-mongodb
       - etc-rabbitmq-ssl:/uos/etc-rabbitmq-ssl
+      # Requests made by "Update" in the UniFi OS console (supervisor.js -> console-update.sh).
+      - boot:/uos/boot
     restart: unless-stopped
 
 volumes:
@@ -86,3 +94,4 @@ volumes:
   var-lib-unifi:
   var-lib-mongodb:
   etc-rabbitmq-ssl:
+  boot:
